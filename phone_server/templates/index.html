@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robot Control</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 24px;
+            background: #f4f4f4;
+            color: #222;
+        }
+
+        .container {
+            max-width: 720px;
+            margin: 0 auto;
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+        }
+
+        h1 {
+            margin-top: 0;
+            text-align: center;
+        }
+
+        .camera {
+            width: 100%;
+            border-radius: 10px;
+            background: #ddd;
+            margin-bottom: 16px;
+        }
+
+        .status {
+            text-align: center;
+            font-size: 1.1rem;
+            margin-bottom: 20px;
+        }
+
+        .controls {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+        }
+
+        button {
+            padding: 14px;
+            font-size: 1rem;
+            border: none;
+            border-radius: 10px;
+            background: #1f6feb;
+            color: #fff;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #1558b0;
+        }
+
+        .stop {
+            background: #d93025;
+        }
+
+        .stop:hover {
+            background: #b42318;
+        }
+
+        .spacer {
+            visibility: hidden;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Robot Control</h1>
+    <img class="camera" src="{{ camera_stream_url }}" alt="Robot camera stream">
+    <div class="status">
+        Last command: <strong id="last-command">{{ last_command }}</strong>
+    </div>
+    <div class="controls">
+        <div class="spacer">.</div>
+        <button onclick="sendCommand('FORWARD')">Forward</button>
+        <div class="spacer">.</div>
+
+        <button onclick="sendCommand('LEFT')">Left</button>
+        <button class="stop" onclick="sendCommand('STOP')">Stop</button>
+        <button onclick="sendCommand('RIGHT')">Right</button>
+
+        <div class="spacer">.</div>
+        <button onclick="sendCommand('BACKWARD')">Backward</button>
+        <div class="spacer">.</div>
+    </div>
+</div>
+
+<script>
+    async function sendCommand(command) {
+        const response = await fetch('/api/command', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ command })
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            alert(data.error || 'Failed to send command');
+            return;
+        }
+
+        document.getElementById('last-command').textContent = data.last_command;
+    }
+</script>
+</body>
+</html>
