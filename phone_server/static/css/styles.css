@@ -1,0 +1,271 @@
+:root {
+    --bg-dark: #0f1720;
+    --bg-deep: #162433;
+    --panel: rgba(247, 243, 235, 0.97);
+    --panel-strong: #fffaf2;
+    --accent: #ff6b35;
+    --accent-dark: #cb4e1f;
+    --danger: #a5281f;
+    --ink: #16212c;
+    --muted: #5c6873;
+    --line: rgba(22, 33, 44, 0.12);
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+    color: var(--ink);
+    background:
+        radial-gradient(circle at top left, rgba(255, 107, 53, 0.26), transparent 32%),
+        radial-gradient(circle at top right, rgba(255, 215, 140, 0.18), transparent 24%),
+        linear-gradient(160deg, var(--bg-dark) 0%, var(--bg-deep) 100%);
+}
+
+.page-shell {
+    width: min(100%, 880px);
+    margin: 0 auto;
+    padding: 20px 16px 40px;
+}
+
+.hero-card,
+.panel {
+    border: 1px solid var(--line);
+    border-radius: 24px;
+    background: var(--panel);
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.18);
+}
+
+.hero-card {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 24px;
+    background: linear-gradient(135deg, #fffaf2 0%, #f6eee4 100%);
+}
+
+.eyebrow {
+    margin: 0 0 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-size: 0.78rem;
+    color: var(--muted);
+}
+
+h1,
+h2 {
+    margin: 0;
+}
+
+h1 {
+    font-size: clamp(2rem, 4vw, 2.8rem);
+}
+
+h2 {
+    font-size: 1.2rem;
+}
+
+.subtitle,
+.section-copy,
+.camera-url {
+    margin: 8px 0 0;
+    color: var(--muted);
+}
+
+.status-pill {
+    padding: 10px 14px;
+    border-radius: 999px;
+    background: var(--bg-dark);
+    color: #f8fafc;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+}
+
+.panel {
+    margin-top: 16px;
+    padding: 20px;
+}
+
+.panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+
+.camera-frame {
+    margin-top: 16px;
+    border-radius: 20px;
+    overflow: hidden;
+    background: #0d141d;
+    aspect-ratio: 16 / 9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+#camera-stream {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    background: #18222d;
+}
+
+#camera-stream.is-hidden {
+    display: none;
+}
+
+.camera-fallback {
+    margin: 0;
+    padding: 24px;
+    text-align: center;
+    color: #f8fafc;
+}
+
+.status-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.status-card {
+    min-height: 112px;
+    padding: 16px;
+    border-radius: 20px;
+    border: 1px solid rgba(22, 33, 44, 0.08);
+    background: linear-gradient(180deg, var(--panel-strong) 0%, #f2ebe1 100%);
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.label {
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+}
+
+#connection-status,
+#last-command {
+    font-size: 1.12rem;
+}
+
+#speed {
+    width: 100%;
+    padding: 12px 14px;
+    border: 1px solid rgba(22, 33, 44, 0.16);
+    border-radius: 14px;
+    font-size: 1rem;
+    color: var(--ink);
+    background: #ffffff;
+}
+
+.error-message {
+    margin: 14px 0 0;
+    padding: 12px 14px;
+    border-radius: 16px;
+    background: #ffe5de;
+    color: var(--danger);
+    font-weight: 600;
+}
+
+.control-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    grid-template-areas:
+        ". forward ."
+        "left stop right"
+        ". backward .";
+}
+
+.control-button {
+    min-height: 82px;
+    border: none;
+    border-radius: 22px;
+    padding: 18px 12px;
+    font: 700 1rem/1.1 "Trebuchet MS", "Segoe UI", sans-serif;
+    color: #ffffff;
+    cursor: pointer;
+    background: linear-gradient(180deg, var(--accent) 0%, var(--accent-dark) 100%);
+    box-shadow: 0 16px 22px rgba(255, 107, 53, 0.28);
+    transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+}
+
+.control-button:hover {
+    transform: translateY(-1px);
+}
+
+.control-button:active {
+    transform: translateY(2px) scale(0.98);
+    box-shadow: 0 8px 14px rgba(255, 107, 53, 0.22);
+}
+
+.control-button:disabled {
+    cursor: wait;
+    opacity: 0.75;
+}
+
+.control-button.stop {
+    background: linear-gradient(180deg, #bf3a2e 0%, #8f2118 100%);
+    box-shadow: 0 16px 22px rgba(143, 33, 24, 0.24);
+}
+
+.forward {
+    grid-area: forward;
+}
+
+.left {
+    grid-area: left;
+}
+
+.stop {
+    grid-area: stop;
+}
+
+.right {
+    grid-area: right;
+}
+
+.backward {
+    grid-area: backward;
+}
+
+@media (max-width: 720px) {
+    .status-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 640px) {
+    .hero-card {
+        flex-direction: column;
+    }
+
+    .status-pill {
+        align-self: flex-start;
+    }
+
+    .page-shell {
+        padding: 16px 12px 32px;
+    }
+
+    .panel,
+    .hero-card {
+        padding: 18px;
+        border-radius: 20px;
+    }
+
+    .control-button {
+        min-height: 76px;
+    }
+}

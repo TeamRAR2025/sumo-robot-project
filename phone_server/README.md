@@ -1,87 +1,203 @@
 # Phone Server
 
-Minimal Flask web application for sending robot control commands from a phone browser.
+This module adds the Milestone 2 phone-side communication and control server to the robotics repository.
+It provides the middle layer for:
 
-## Project contents
+`browser -> Flask server on phone -> ESP32 -> motor`
+
+The phone is expected to run in access point mode and expose a camera stream while the Flask app serves the control UI.
+
+## How It Fits The Repository
+
+`phone_server/` is a self-contained module inside the existing repository. It does not restructure or replace the rest of the project. The other folders such as `analysis`, `bom`, `cad`, `diagrams`, and `docs` remain untouched.
+
+## Folder Structure
 
 ```text
 phone_server/
-├── app.py
-├── requirements.txt
-├── README.md
-├── templates/
-│   └── index.html
-└── static/
-    ├── css/
-    └── js/
+|-- app.py
+|-- config.py
+|-- requirements.txt
+|-- README.md
+|-- services/
+|   \-- esp32_client.py
+|-- templates/
+|   \-- index.html
+|-- static/
+|   |-- css/
+|   |   \-- styles.css
+|   \-- js/
+|       \-- controls.js
+\-- tests/
+    \-- test_routes.py
 ```
 
-## Run in Termux
+## What This Module Does
 
-1. Install packages:
+- Serves a mobile-friendly web page at `/` titled `Sumo Robot Control`
+- Embeds the phone camera stream with `<img src="{{ camera_stream_url }}" alt="Camera stream">`
+- Sends movement commands from the browser to Flask and then to the ESP32 over HTTP
+- Tracks the current connection status, last command, and last speed in memory
+- Exposes JSON endpoints for command sending, status checks, and health checks
 
-```sh
-pkg update
-pkg install python mosquitto
+## Default Network Configuration
+
+The known Milestone 2 defaults are configured in [`config.py`](./config.py):
+
+- Phone AP IP: `192.168.43.1`
+- Camera base URL: `http://192.168.43.1:8080`
+- Camera stream URL: `http://192.168.43.1:8080/video`
+- ESP32 base URL: `http://192.168.43.2`
+- ESP32 command endpoint: `/cmd`
+
+## Local Run On A Laptop
+
+From the repository root:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r phone_server\requirements.txt
+python phone_server\app.py
 ```
 
-2. Go to the project folder:
-
-```sh
-cd /path/to/sumo-robot-project/phone_server
-```
-
-3. Install Python dependencies:
-
-```sh
-pip install -r requirements.txt
-```
-
-## Start the MQTT broker
-
-Run a local Mosquitto broker in Termux:
-
-```sh
-mosquitto -p 1883
-```
-
-The Flask app publishes robot commands to:
-
-```text
-robot/command
-```
-
-## Start the Flask server
-
-In a second Termux session:
-
-```sh
-cd /path/to/sumo-robot-project/phone_server
-python app.py
-```
-
-The server listens on:
+The Flask server listens on:
 
 ```text
 http://0.0.0.0:5000
 ```
 
-## Open the UI in a browser
-
-Open the phone browser and go to:
+Open the UI in a browser:
 
 ```text
 http://127.0.0.1:5000
 ```
 
-If you want to open it from another device on the same network, replace `127.0.0.1` with the phone IP address.
+Run the tests:
 
-## Camera stream
-
-The UI displays a camera stream from:
-
-```text
-http://127.0.0.1:8080/video
+```powershell
+python -m pytest phone_server\tests
 ```
 
-Update the `CAMERA_STREAM_URL` constant in `app.py` if your stream uses a different address.
+## Later Run In Termux On The Phone
+
+```sh
+pkg update
+pkg install python
+cd /path/to/sumo-robot-project/phone_server
+pip install -r requirements.txt
+python app.py
+```
+
+When the phone is running in AP mode, connect a browser client to the phone network and open:
+
+```text
+http://192.168.43.1:5000
+```
+
+The camera stream is expected at:
+
+```text
+http://192.168.43.1:8080/video
+```
+
+## ESP32 Communication
+
+The reusable ESP32 client lives in [`services/esp32_client.py`](./services/esp32_client.py).
+
+Current request format:
+
+```text
+GET /cmd?c=f&s=150
+```
+
+Command mapping:
+
+- `FORWARD -> f`
+- `BACKWARD -> b`
+- `LEFT -> l`
+- `RIGHT -> r`
+- `STOP -> s`
+
+The request-building logic is separated from the transport call so the project can later switch to POST JSON more easily.
+
+## API Endpoints
+
+### `GET /`
+
+Renders the control page with:
+
+- camera stream
+- connection status
+- last command
+- speed input
+- Forward, Backward, Left, Right, Stop buttons
+
+### `POST /api/command`
+
+Request:
+
+```json
+{
+  "command": "FORWARD",
+  "speed": 150
+}
+```
+
+Successful response example:
+
+```json
+{
+  "status": "ok",
+  "sent_command": "FORWARD",
+  "speed": 150,
+  "esp32_response": "OK:f",
+  "connection_status": "Connected to ESP32"
+}
+```
+
+### `GET /api/status`
+
+Example response:
+
+```json
+{
+  "status": "running",
+  "phone_ap_ip": "192.168.43.1",
+  "camera_stream_url": "http://192.168.43.1:8080/video",
+  "esp32_base_url": "http://192.168.43.2",
+  "last_command": "STOP",
+  "last_speed": 150,
+  "connection_status": "Idle",
+  "last_error": null
+}
+```
+
+### `GET /health`
+
+Example response:
+
+```json
+{
+  "status": "ok"
+}
+```
+
+## Camera Stream Behavior
+
+The UI keeps working even if the camera stream fails to load. In that case the page shows a fallback message instead of blocking robot controls.
+
+## Known Limitations
+
+- No authentication is included
+- No persistent storage or database is used
+- The latest state is only kept in memory while the Flask process is running
+- The Flask app assumes the ESP32 already exposes `/cmd`
+- The camera stream is embedded directly and not proxied through Flask
+
+## Next Steps
+
+- Add hold-to-drive or touch events for smoother robot control
+- Add an ESP32 health probe endpoint and display it in `/api/status`
+- Add POST JSON support for ESP32 commands if the firmware changes
+- Add optional telemetry such as battery level or sensor status
