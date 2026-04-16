@@ -19,6 +19,10 @@ phone_server/
 |-- config.py
 |-- requirements.txt
 |-- README.md
+|-- esp32/
+|   |-- README.md
+|   \-- phone_ap_api_logger/
+|       \-- phone_ap_api_logger.ino
 |-- services/
 |   \-- esp32_client.py
 |-- templates/
@@ -104,6 +108,7 @@ http://192.168.43.1:8080/video
 ## ESP32 Communication
 
 The reusable ESP32 client lives in [`services/esp32_client.py`](./services/esp32_client.py).
+An example ESP32 sketch that joins the phone AP and logs incoming API requests lives in [`esp32/phone_ap_api_logger/phone_ap_api_logger.ino`](./esp32/phone_ap_api_logger/phone_ap_api_logger.ino).
 
 Current request format:
 
