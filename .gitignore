@@ -32,3 +32,5 @@ ENV/
 .env.*
 *.local
 
+# PlatformIO build artifacts
+.pio/
