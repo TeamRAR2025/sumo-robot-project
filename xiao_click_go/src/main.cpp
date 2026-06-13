@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <HTTPClient.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include "esp_camera.h"
@@ -40,9 +39,11 @@ static const IPAddress AP_SUBNET(255, 255, 255, 0);
 static const char *STA_SSID = "CHANGE_ME";
 static const char *STA_PASSWORD = "CHANGE_ME";
 
-// Motor ESP32 HTTP API. Edit if your motor controller has another IP.
-static const char *MOTOR_BASE_URL = "http://192.168.4.2";
-static const char *MOTOR_QR_ENDPOINT = "/qr";
+// Wired UART link to the motor ESP32.
+static constexpr uint32_t MOTOR_UART_BAUD = 115200;
+static constexpr int MOTOR_UART_TX_PIN = D6; // XIAO D6 / GPIO43 / TX -> motor ESP32 RX
+static constexpr int MOTOR_UART_RX_PIN = D7; // XIAO D7 / GPIO44 / RX <- motor ESP32 TX
+static constexpr uint16_t HEARTBEAT_INTERVAL_MS = 500;
 static constexpr uint16_t HTTP_PORT = 80;
 static constexpr uint16_t STREAM_PORT = 81;
 
@@ -77,11 +78,16 @@ struct MotionPlan {
 
 static MotionPlan plan;
 static String lastMotorCommand = "s";
-static int lastMotorHttpCode = 0;
+static uint32_t motorSequence = 0;
+static unsigned long uartTxCount = 0;
+static String lastMotorMessage = "";
+static String lastMotorAck = "";
+static String uartRxLine = "";
+static unsigned long lastHeartbeatMs = 0;
 static unsigned long clickCount = 0;
 static String lastQrId = "";
 static unsigned long qrCount = 0;
-static int lastQrForwardHttpCode = 0;
+static bool lastQrForwarded = false;
 
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!doctype html>
@@ -442,7 +448,7 @@ async function postQrId(value) {
 
   const response = await fetch(`/api/qr?${params.toString()}`, { method: "POST" });
   const data = await response.json();
-  qrSent.textContent = data.forwarded ? `yes (${data.forward_http_code})` : "local";
+  qrSent.textContent = data.forwarded ? `uart seq ${data.seq}` : "local";
   statusBox.textContent = JSON.stringify(data, null, 2);
 }
 
@@ -580,84 +586,89 @@ uint16_t boundedSpeed(long value) {
   return static_cast<uint16_t>(value);
 }
 
-bool sendMotorCommand(const String &code, uint16_t speed) {
-  if (WiFi.status() != WL_CONNECTED && WiFi.getMode() != WIFI_AP) {
-    plan.lastError = "Wi-Fi is not connected";
-    return false;
-  }
-
-  const String url = String(MOTOR_BASE_URL) + "/cmd?c=" + code + "&s=" + String(speed);
-  HTTPClient http;
-  http.setTimeout(700);
-
-  Serial.printf("Motor request: %s\n", url.c_str());
-  if (!http.begin(url)) {
-    plan.lastError = "HTTP begin failed";
-    return false;
-  }
-
-  const int httpCode = http.GET();
-  const String body = http.getString();
-  http.end();
-
-  lastMotorCommand = code;
-  lastMotorHttpCode = httpCode;
-
-  Serial.printf("Motor response: code=%d body=%s\n", httpCode, body.c_str());
-  if (httpCode < 200 || httpCode >= 300) {
-    plan.lastError = "Motor HTTP error " + String(httpCode);
-    return false;
-  }
-
+bool sendMotorJson(const String &json) {
+  Serial1.println(json);
+  lastMotorMessage = json;
+  uartTxCount++;
+  Serial.printf("Motor UART TX: %s\n", json.c_str());
   plan.lastError = "";
   return true;
 }
 
-String urlEncode(const String &value) {
-  String encoded;
-  encoded.reserve(value.length() * 3);
-  static const char hex[] = "0123456789ABCDEF";
-
-  for (size_t i = 0; i < value.length(); i++) {
-    const uint8_t c = static_cast<uint8_t>(value[i]);
-    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-        c == '-' || c == '_' || c == '.' || c == '~') {
-      encoded += static_cast<char>(c);
-    } else {
-      encoded += '%';
-      encoded += hex[c >> 4];
-      encoded += hex[c & 0x0F];
-    }
+uint32_t nextMotorSequence() {
+  motorSequence++;
+  if (motorSequence == 0) {
+    motorSequence = 1;
   }
+  return motorSequence;
+}
 
-  return encoded;
+bool sendMotorCommand(const String &code, uint16_t speed) {
+  const uint32_t seq = nextMotorSequence();
+  lastMotorCommand = code;
+
+  String json = "{";
+  json += "\"seq\":" + String(seq) + ",";
+  json += "\"type\":\"cmd\",";
+  json += "\"cmd\":\"" + jsonEscape(code) + "\",";
+  json += "\"speed\":" + String(speed);
+  json += "}";
+
+  return sendMotorJson(json);
 }
 
 bool forwardQrToMotor(const String &qrId) {
-  const String url = String(MOTOR_BASE_URL) + MOTOR_QR_ENDPOINT + "?id=" + urlEncode(qrId);
-  HTTPClient http;
-  http.setTimeout(700);
+  const uint32_t seq = nextMotorSequence();
 
-  Serial.printf("QR forward request: %s\n", url.c_str());
-  if (!http.begin(url)) {
-    plan.lastError = "QR HTTP begin failed";
-    return false;
+  String json = "{";
+  json += "\"seq\":" + String(seq) + ",";
+  json += "\"type\":\"qr\",";
+  json += "\"id\":\"" + jsonEscape(qrId) + "\"";
+  json += "}";
+
+  return sendMotorJson(json);
+}
+
+void sendHeartbeatIfDue() {
+  const unsigned long now = millis();
+  if (now - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) {
+    return;
   }
 
-  const int httpCode = http.GET();
-  const String body = http.getString();
-  http.end();
+  lastHeartbeatMs = now;
+  const uint32_t seq = nextMotorSequence();
 
-  lastQrForwardHttpCode = httpCode;
-  Serial.printf("QR forward response: code=%d body=%s\n", httpCode, body.c_str());
+  String json = "{";
+  json += "\"seq\":" + String(seq) + ",";
+  json += "\"type\":\"heartbeat\",";
+  json += "\"ms\":" + String(now);
+  json += "}";
 
-  if (httpCode < 200 || httpCode >= 300) {
-    plan.lastError = "QR forward HTTP error " + String(httpCode);
-    return false;
+  sendMotorJson(json);
+}
+
+void readMotorAck() {
+  while (Serial1.available() > 0) {
+    const char c = static_cast<char>(Serial1.read());
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      if (uartRxLine.length() > 0) {
+        lastMotorAck = uartRxLine;
+        Serial.printf("Motor UART RX: %s\n", lastMotorAck.c_str());
+        uartRxLine = "";
+      }
+      continue;
+    }
+
+    if (uartRxLine.length() < 240) {
+      uartRxLine += c;
+    } else {
+      uartRxLine = "";
+      plan.lastError = "Motor UART RX line too long";
+    }
   }
-
-  plan.lastError = "";
-  return true;
 }
 
 void cancelMotion() {
@@ -882,13 +893,18 @@ void handleStatus() {
   json += "\"status\":\"ok\",";
   json += "\"ip\":\"" + ip.toString() + "\",";
   json += "\"stream_url\":\"http://" + ip.toString() + ":" + String(STREAM_PORT) + "/stream\",";
-  json += "\"motor_base_url\":\"" + String(MOTOR_BASE_URL) + "\",";
+  json += "\"motor_uart_baud\":" + String(MOTOR_UART_BAUD) + ",";
+  json += "\"motor_uart_tx_pin\":" + String(MOTOR_UART_TX_PIN) + ",";
+  json += "\"motor_uart_rx_pin\":" + String(MOTOR_UART_RX_PIN) + ",";
   json += "\"motion_phase\":\"" + String(phaseName(plan.phase)) + "\",";
   json += "\"last_motor_command\":\"" + lastMotorCommand + "\",";
-  json += "\"last_motor_http_code\":" + String(lastMotorHttpCode) + ",";
+  json += "\"motor_sequence\":" + String(motorSequence) + ",";
+  json += "\"uart_tx_count\":" + String(uartTxCount) + ",";
+  json += "\"last_motor_message\":\"" + jsonEscape(lastMotorMessage) + "\",";
+  json += "\"last_motor_ack\":\"" + jsonEscape(lastMotorAck) + "\",";
   json += "\"last_qr_id\":\"" + jsonEscape(lastQrId) + "\",";
   json += "\"qr_count\":" + String(qrCount) + ",";
-  json += "\"last_qr_forward_http_code\":" + String(lastQrForwardHttpCode) + ",";
+  json += "\"last_qr_forwarded\":" + String(lastQrForwarded ? "true" : "false") + ",";
   json += "\"click_count\":" + String(clickCount) + ",";
   json += "\"turn_ms\":" + String(plan.turnMs) + ",";
   json += "\"drive_ms\":" + String(plan.driveMs) + ",";
@@ -961,6 +977,7 @@ void handleQr() {
   if (shouldForward) {
     forwarded = forwardQrToMotor(lastQrId);
   }
+  lastQrForwarded = forwarded;
 
   String json = "{";
   json += "\"status\":\"ok\",";
@@ -968,7 +985,7 @@ void handleQr() {
   json += "\"qr_count\":" + String(qrCount) + ",";
   json += "\"forward_requested\":" + String(shouldForward ? "true" : "false") + ",";
   json += "\"forwarded\":" + String(forwarded ? "true" : "false") + ",";
-  json += "\"forward_http_code\":" + String(lastQrForwardHttpCode) + ",";
+  json += "\"seq\":" + String(motorSequence) + ",";
   json += "\"last_error\":\"" + jsonEscape(plan.lastError) + "\"";
   json += "}";
   web.send(200, "application/json", json);
@@ -1000,10 +1017,16 @@ void startWebRoutes() {
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
+  Serial1.begin(MOTOR_UART_BAUD, SERIAL_8N1, MOTOR_UART_RX_PIN, MOTOR_UART_TX_PIN);
   delay(800);
 
   Serial.println();
   Serial.println("Starting XIAO Click-And-Go");
+  Serial.printf(
+      "Motor UART: baud=%lu TX=D6/GPIO%d RX=D7/GPIO%d\n",
+      static_cast<unsigned long>(MOTOR_UART_BAUD),
+      MOTOR_UART_TX_PIN,
+      MOTOR_UART_RX_PIN);
 
   if (!initCamera()) {
     Serial.println("Camera failed; UI will not be useful until this is fixed.");
@@ -1015,6 +1038,8 @@ void setup() {
 }
 
 void loop() {
+  readMotorAck();
+  sendHeartbeatIfDue();
   web.handleClient();
   updateMotionPlan();
   delay(2);
