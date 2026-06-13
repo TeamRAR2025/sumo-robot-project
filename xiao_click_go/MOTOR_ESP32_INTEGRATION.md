@@ -1,6 +1,14 @@
-# Motor ESP32 Integration Guide
+# Motor ESP32 UART Integration Guide
 
-This document defines what the second ESP32 must expose so the XIAO ESP32-S3 Sense can control the robot over HTTP.
+This document defines the wired protocol between the XIAO ESP32-S3 Sense and the second ESP32 that controls the motors.
+
+The recommended architecture is:
+
+```text
+Browser <--Wi-Fi--> XIAO ESP32-S3 Sense <--UART wires--> Motor ESP32
+```
+
+Wi-Fi is used only where it is useful: browser UI, camera stream, QR display, and click-and-go interaction. The robot-internal control link is a short wired UART connection.
 
 ## System Roles
 
@@ -13,428 +21,301 @@ Browser
 XIAO ESP32-S3 Sense
   -> creates Wi-Fi AP
   -> serves camera stream and web UI
-  -> converts click into timed motion command
-  -> forwards HTTP commands to motor ESP32
-  -> optionally forwards detected QR ID
+  -> converts click into timed movement
+  -> sends UART JSON-lines to motor ESP32
+  -> sends QR IDs over UART when forwarding is enabled
 
 Motor ESP32
-  -> connects to XIAO Wi-Fi AP
-  -> receives HTTP commands
+  -> receives UART JSON-lines
   -> drives motor driver pins
-  -> optionally receives QR ID
+  -> sends UART JSON acknowledgements
+  -> stops motors if UART link goes silent
 ```
 
-## Required Network Setup
+## Wiring
 
-Default XIAO access point:
+Default XIAO firmware pins:
 
 ```text
-SSID: SumoVision
-Password: sumo1234
-XIAO IP: 192.168.4.1
+XIAO D6 / GPIO43 / TX -> Motor ESP32 RX
+XIAO D7 / GPIO44 / RX <- Motor ESP32 TX
+XIAO GND              -> Motor ESP32 GND
 ```
 
-The motor ESP32 should connect as a Wi-Fi station and use this static IP:
+Default motor skeleton pins:
 
 ```text
-Motor ESP32 IP: 192.168.4.2
-Gateway: 192.168.4.1
-Subnet: 255.255.255.0
+Motor ESP32 GPIO16 / RX2 <- XIAO D6 / TX
+Motor ESP32 GPIO17 / TX2 -> XIAO D7 / RX
 ```
 
-The XIAO firmware currently sends requests to:
+Both boards use 3.3 V UART logic. Do not use 5 V level shifting.
+
+If you choose different motor ESP32 pins, update:
+
+```text
+motor_esp32_uart/src/main.cpp
+```
 
 ```cpp
-static const char *MOTOR_BASE_URL = "http://192.168.4.2";
+static constexpr int MOTOR_UART_RX_PIN = 16;
+static constexpr int MOTOR_UART_TX_PIN = 17;
 ```
 
-If the motor ESP32 uses another IP, update `MOTOR_BASE_URL` in:
+If you choose different XIAO pins, update:
 
 ```text
 xiao_click_go/src/main.cpp
 ```
 
-## Required Endpoint: Movement Command
-
-The motor ESP32 must expose:
-
-```text
-GET /cmd?c=<command>&s=<speed>
+```cpp
+static constexpr int MOTOR_UART_TX_PIN = D6;
+static constexpr int MOTOR_UART_RX_PIN = D7;
 ```
 
-### Command Codes
+## UART Settings
+
+```text
+Baud: 115200
+Data: 8 bits
+Parity: none
+Stop: 1 bit
+Message format: UTF-8 JSON followed by newline
+```
+
+Every message is one line:
+
+```text
+{"seq":1,"type":"cmd","cmd":"f","speed":150}\n
+```
+
+## Messages From XIAO To Motor ESP32
+
+### Movement Command
+
+```json
+{"seq":1,"type":"cmd","cmd":"f","speed":150}
+```
+
+Fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `seq` | integer | Monotonic message ID |
+| `type` | string | Always `cmd` for movement |
+| `cmd` | string | Movement command |
+| `speed` | integer | PWM-style speed, `0..255` |
+
+Command codes:
 
 | Code | Meaning | Required Behavior |
 | --- | --- | --- |
 | `f` | Forward | Both wheels drive forward |
 | `b` | Backward | Both wheels drive backward |
-| `l` | Left | Turn left in place or with left-turn strategy |
-| `r` | Right | Turn right in place or with right-turn strategy |
+| `l` | Left | Turn left in place or with your chosen turn strategy |
+| `r` | Right | Turn right in place or with your chosen turn strategy |
 | `s` | Stop | Stop both motors immediately |
 
-### Speed
+### QR ID
 
-`s` is an integer from `0` to `255`.
-
-Example:
-
-```text
-GET /cmd?c=f&s=150
-```
-
-Motor ESP32 should clamp invalid speed values to a safe range or reject the request with HTTP `400`.
-
-### Expected Success Response
-
-Response can be plain text or JSON. XIAO only requires an HTTP `2xx` status code.
-
-Recommended plain text:
-
-```text
-OK:f
-```
-
-Recommended JSON:
-
-```json
-{
-  "status": "ok",
-  "command": "f",
-  "speed": 150
-}
-```
-
-### Expected Error Responses
-
-Missing command:
-
-```text
-HTTP 400
-```
-
-```json
-{
-  "status": "error",
-  "error": "Missing command code"
-}
-```
-
-Unknown command:
-
-```text
-HTTP 400
-```
-
-```json
-{
-  "status": "error",
-  "error": "Unknown command code"
-}
-```
-
-## Optional Endpoint: QR ID
-
-If the robot needs to react to QR IDs, the motor ESP32 should expose:
-
-```text
-GET /qr?id=<qr_text>
-```
-
-Example:
-
-```text
-GET /qr?id=A1
-```
-
-The XIAO calls this only when the browser UI checkbox is enabled:
+XIAO sends this only when the browser UI checkbox is enabled:
 
 ```text
 Forward QR ID to motor ESP32
 ```
 
-If QR reaction is not needed yet, do not implement `/qr`; keep forwarding disabled in the XIAO UI.
+Message:
 
-### Expected QR Success Response
-
-Plain text:
-
-```text
-OK:A1
+```json
+{"seq":2,"type":"qr","id":"A1"}
 ```
 
-or JSON:
+The motor ESP32 may store this value, use it as a target ID, or ignore it. Do not move motors directly from a QR message unless the team intentionally wants QR-triggered behavior.
+
+### Heartbeat
+
+XIAO sends heartbeat messages about every 500 ms:
+
+```json
+{"seq":3,"type":"heartbeat","ms":123456}
+```
+
+The motor ESP32 should use any valid incoming message as proof that the link is alive.
+
+## Messages From Motor ESP32 To XIAO
+
+The motor ESP32 should acknowledge every valid line with one JSON line.
+
+Command acknowledgement:
+
+```json
+{"seq":1,"status":"ok","type":"cmd","cmd":"f","speed":150}
+```
+
+QR acknowledgement:
+
+```json
+{"seq":2,"status":"ok","type":"qr","id":"A1"}
+```
+
+Error acknowledgement:
+
+```json
+{"seq":4,"status":"error","type":"cmd","error":"unknown command"}
+```
+
+XIAO currently displays the latest raw acknowledgement in `/api/status` as:
 
 ```json
 {
-  "status": "ok",
-  "id": "A1"
-}
-```
-
-## Recommended Endpoint: Health Check
-
-This is not required by XIAO yet, but it is useful for debugging:
-
-```text
-GET /health
-```
-
-Recommended response:
-
-```json
-{
-  "status": "ok",
-  "wifi_connected": true,
-  "ip": "192.168.4.2",
-  "last_command": "s",
-  "last_speed": 0,
-  "last_qr_id": "A1"
+  "last_motor_ack": "{\"seq\":1,\"status\":\"ok\",\"type\":\"cmd\",\"cmd\":\"f\",\"speed\":150}"
 }
 ```
 
 ## XIAO Command Timing
 
-The XIAO does not send a single high-level `drive_to` command to the motor ESP32.
+XIAO does not send one high-level `drive_to` command.
 
-Instead, it sends simple timed commands:
+It sends simple timed motor states:
 
 ```text
-/cmd?c=r&s=150
+cmd=r
 wait turn_ms
-/cmd?c=s&s=0
+cmd=s
 wait short settle time
-/cmd?c=f&s=150
+cmd=f
 wait drive_ms
-/cmd?c=s&s=0
+cmd=s
 ```
 
-This means the motor ESP32 should immediately apply each command and keep that motor state until the next command arrives.
-
-Do not add long delays inside the motor ESP32 HTTP handlers. The XIAO is already responsible for timing.
+The motor ESP32 must apply each command immediately and keep that motor state until the next command arrives or the UART watchdog fires.
 
 ## Safety Requirements
 
-The motor ESP32 should implement these safety rules:
+The motor ESP32 should implement these rules:
 
-1. `s` must stop motors immediately.
-2. Unknown commands must not move the robot.
-3. Missing parameters must not move the robot.
-4. If no command is received for a timeout period, stop motors.
+1. `cmd=s` must stop motors immediately.
+2. Unknown commands must stop motors and return an error ACK.
+3. Invalid or too-long messages must stop motors.
+4. If the UART link goes silent, stop motors.
 5. Clamp speed to `0..255`.
+6. Start with motor outputs disabled until direction logic is verified.
 
-Recommended watchdog:
+Recommended link watchdog:
 
 ```text
-If last command age > 1500 ms, stop motors.
+If no UART message arrives for 1200 ms, stop motors.
 ```
 
-This prevents the robot from continuing to drive if Wi-Fi drops.
+This works because XIAO sends heartbeat messages while it is alive. If XIAO crashes or a wire disconnects, heartbeat stops and the motor ESP32 stops the robot.
 
-## Minimal Arduino-Style Motor ESP32 Skeleton
+## Provided Motor Firmware Skeleton
 
-This is a protocol skeleton. Replace pin numbers and motor functions with your actual driver wiring.
+A safe starter firmware is included:
+
+```text
+motor_esp32_uart/
+```
+
+It provides:
+
+- UART receive on `Serial2`
+- JSON-line parsing for `cmd`, `qr`, and `heartbeat`
+- JSON ACKs back to XIAO
+- link watchdog
+- safe disabled motor outputs by default
+
+Build it:
+
+```powershell
+cd C:\Users\finmi\PycharmProjects\sumo-robot-project\motor_esp32_uart
+$env:PYTHONUTF8='1'
+$env:PYTHONIOENCODING='utf-8'
+..\venv\Scripts\pio.exe run
+```
+
+Before enabling motors, edit:
+
+```text
+motor_esp32_uart/src/main.cpp
+```
+
+Fill in:
 
 ```cpp
-#include <WiFi.h>
-#include <WebServer.h>
+void stopMotors()
+void driveForward(int speed)
+void driveBackward(int speed)
+void turnLeft(int speed)
+void turnRight(int speed)
+```
 
-const char* WIFI_SSID = "SumoVision";
-const char* WIFI_PASSWORD = "sumo1234";
+Then set:
 
-IPAddress LOCAL_IP(192, 168, 4, 2);
-IPAddress GATEWAY(192, 168, 4, 1);
-IPAddress SUBNET(255, 255, 255, 0);
-
-WebServer server(80);
-
-String lastCommand = "s";
-int lastSpeed = 0;
-String lastQrId = "";
-unsigned long lastCommandMs = 0;
-
-const unsigned long COMMAND_TIMEOUT_MS = 1500;
-
-void stopMotors() {
-  // TODO: set motor PWM to 0 and brake/coast safely.
-}
-
-void driveForward(int speed) {
-  // TODO: motor driver forward.
-}
-
-void driveBackward(int speed) {
-  // TODO: motor driver backward.
-}
-
-void turnLeft(int speed) {
-  // TODO: motor driver left turn.
-}
-
-void turnRight(int speed) {
-  // TODO: motor driver right turn.
-}
-
-int clampSpeed(int speed) {
-  if (speed < 0) return 0;
-  if (speed > 255) return 255;
-  return speed;
-}
-
-void applyCommand(const String& command, int speed) {
-  if (command == "f") {
-    driveForward(speed);
-  } else if (command == "b") {
-    driveBackward(speed);
-  } else if (command == "l") {
-    turnLeft(speed);
-  } else if (command == "r") {
-    turnRight(speed);
-  } else {
-    stopMotors();
-  }
-}
-
-void handleCommand() {
-  if (!server.hasArg("c")) {
-    stopMotors();
-    server.send(400, "application/json", "{\"status\":\"error\",\"error\":\"Missing command code\"}");
-    return;
-  }
-
-  String command = server.arg("c");
-  command.toLowerCase();
-
-  if (command != "f" && command != "b" && command != "l" && command != "r" && command != "s") {
-    stopMotors();
-    server.send(400, "application/json", "{\"status\":\"error\",\"error\":\"Unknown command code\"}");
-    return;
-  }
-
-  const int speed = clampSpeed(server.hasArg("s") ? server.arg("s").toInt() : 150);
-
-  lastCommand = command;
-  lastSpeed = speed;
-  lastCommandMs = millis();
-
-  applyCommand(command, speed);
-
-  server.send(200, "application/json",
-              "{\"status\":\"ok\",\"command\":\"" + command + "\",\"speed\":" + String(speed) + "}");
-}
-
-void handleQr() {
-  if (!server.hasArg("id")) {
-    server.send(400, "application/json", "{\"status\":\"error\",\"error\":\"Missing QR id\"}");
-    return;
-  }
-
-  lastQrId = server.arg("id");
-
-  // TODO: optional behavior, for example update target zone.
-  // Do not move motors here unless your team intentionally wants QR-triggered motion.
-
-  server.send(200, "application/json",
-              "{\"status\":\"ok\",\"id\":\"" + lastQrId + "\"}");
-}
-
-void handleHealth() {
-  String json = "{";
-  json += "\"status\":\"ok\",";
-  json += "\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
-  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-  json += "\"last_command\":\"" + lastCommand + "\",";
-  json += "\"last_speed\":" + String(lastSpeed) + ",";
-  json += "\"last_qr_id\":\"" + lastQrId + "\"";
-  json += "}";
-  server.send(200, "application/json", json);
-}
-
-void connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.config(LOCAL_IP, GATEWAY, SUBNET);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(250);
-  }
-}
-
-void setup() {
-  Serial.begin(115200);
-
-  // TODO: pinMode setup for motor driver pins.
-  stopMotors();
-
-  connectWiFi();
-
-  server.on("/cmd", HTTP_GET, handleCommand);
-  server.on("/qr", HTTP_GET, handleQr);
-  server.on("/health", HTTP_GET, handleHealth);
-  server.begin();
-}
-
-void loop() {
-  server.handleClient();
-
-  if (lastCommand != "s" && millis() - lastCommandMs > COMMAND_TIMEOUT_MS) {
-    lastCommand = "s";
-    lastSpeed = 0;
-    stopMotors();
-  }
-}
+```cpp
+static constexpr bool MOTOR_OUTPUTS_ENABLED = true;
 ```
 
 ## Integration Test Sequence
 
-### 1. Test Motor ESP32 Alone
+### 1. Test XIAO Alone
 
-Connect a laptop or phone to `SumoVision` and open:
-
-```text
-http://192.168.4.2/health
-```
-
-Expected:
-
-```json
-{
-  "status": "ok"
-}
-```
-
-Then test stop:
-
-```text
-http://192.168.4.2/cmd?c=s&s=0
-```
+Upload XIAO firmware and open serial monitor.
 
 Expected:
 
 ```text
-Robot does not move and endpoint returns HTTP 200.
+Starting XIAO Click-And-Go
+Motor UART: baud=115200 TX=D6/GPIO43 RX=D7/GPIO44
+XIAO AP SSID: SumoVision
 ```
 
-### 2. Test Each Manual Motor Command
-
-Use low speed first:
+Open:
 
 ```text
-http://192.168.4.2/cmd?c=f&s=80
-http://192.168.4.2/cmd?c=s&s=0
-http://192.168.4.2/cmd?c=b&s=80
-http://192.168.4.2/cmd?c=s&s=0
-http://192.168.4.2/cmd?c=l&s=80
-http://192.168.4.2/cmd?c=s&s=0
-http://192.168.4.2/cmd?c=r&s=80
-http://192.168.4.2/cmd?c=s&s=0
+http://192.168.4.1
 ```
 
-If a direction is inverted, fix it on the motor ESP32 side by swapping motor direction logic or wiring.
+The UI should load and camera stream should appear.
 
-### 3. Test XIAO To Motor ESP32
+### 2. Test Motor ESP32 Alone
 
-Open XIAO UI:
+Upload `motor_esp32_uart` and open its serial monitor.
+
+Expected:
+
+```text
+Motor ESP32 UART firmware skeleton
+UART: baud=115200 RX=GPIO16 TX=GPIO17
+Motor outputs enabled: false
+```
+
+### 3. Wire The Boards
+
+Power off before wiring:
+
+```text
+XIAO D6/TX -> Motor ESP32 GPIO16/RX2
+XIAO D7/RX <- Motor ESP32 GPIO17/TX2
+GND        -> GND
+```
+
+Power both boards.
+
+### 4. Check Heartbeat
+
+In the motor ESP32 serial monitor, you should see messages like:
+
+```text
+UART RX: {"seq":1,"type":"heartbeat","ms":123456}
+UART TX: {"seq":1,"status":"ok","type":"heartbeat"}
+```
+
+In the XIAO UI `/api/status`, `last_motor_ack` should update.
+
+### 5. Test Click-To-Command
+
+Open:
 
 ```text
 http://192.168.4.1
@@ -442,27 +323,20 @@ http://192.168.4.1
 
 Click the camera image.
 
-Expected XIAO behavior:
+Motor ESP32 serial monitor should show a sequence similar to:
 
 ```text
-XIAO sends /cmd requests to 192.168.4.2.
+UART RX: {"seq":10,"type":"cmd","cmd":"r","speed":150}
+UART RX: {"seq":11,"type":"cmd","cmd":"s","speed":0}
+UART RX: {"seq":12,"type":"cmd","cmd":"f","speed":150}
+UART RX: {"seq":13,"type":"cmd","cmd":"s","speed":0}
 ```
 
-Expected motor ESP32 behavior:
+With motor outputs disabled, this only logs. After motor functions are implemented and tested, the robot should move.
 
-```text
-Robot turns/drives/stops according to received commands.
-```
+### 6. Test QR Forwarding
 
-### 4. Test QR Forwarding
-
-First test motor endpoint directly:
-
-```text
-http://192.168.4.2/qr?id=A1
-```
-
-Then open XIAO UI:
+Open XIAO UI:
 
 ```text
 http://192.168.4.1
@@ -474,37 +348,46 @@ Enable:
 Forward QR ID to motor ESP32
 ```
 
-Show QR code `A1` to the XIAO camera.
+Show QR code `A1` to the camera.
 
-Expected:
+Expected motor serial output:
 
 ```text
-XIAO UI: Last QR = A1
-XIAO UI: Sent = yes (200)
-Motor ESP32 /health: last_qr_id = A1
+UART RX: {"seq":20,"type":"qr","id":"A1"}
+UART TX: {"seq":20,"status":"ok","type":"qr","id":"A1"}
+```
+
+Expected XIAO UI:
+
+```text
+Last QR: A1
+Sent: uart seq 20
 ```
 
 ## Troubleshooting
 
 | Symptom | Likely Cause | Fix |
 | --- | --- | --- |
-| XIAO UI shows motor HTTP error | Motor ESP32 is offline or wrong IP | Check Wi-Fi and static IP |
-| `/health` does not open | Motor ESP32 not connected to `SumoVision` | Check SSID/password |
-| Robot keeps moving after command | Missing watchdog or stop logic | Implement timeout and stop command |
-| Robot direction is inverted | Motor wiring or direction logic is reversed | Fix motor ESP32 motor functions |
-| QR appears in XIAO UI but not on motor ESP32 | QR forwarding disabled or `/qr` missing | Enable checkbox and implement `/qr` |
-| `forward_http_code` is not 200 | Motor ESP32 rejected QR request | Check `/qr?id=...` handler |
+| Motor ESP32 sees no heartbeat | TX/RX swapped, missing GND, wrong pins | Check wiring and pin constants |
+| XIAO sees no ACK | Motor TX not connected to XIAO RX | Check XIAO D7/RX and motor TX pin |
+| Garbled serial data | Baud mismatch | Use 115200 on both boards |
+| Motor logs commands but robot does not move | `MOTOR_OUTPUTS_ENABLED` is false | Fill motor functions and enable outputs |
+| Robot moves wrong direction | Motor wiring or direction logic inverted | Fix motor-side functions |
+| Robot keeps moving after XIAO unplugged | Watchdog not stopping motors | Check `LINK_TIMEOUT_MS` and `stopMotors()` |
+| QR appears in UI but not on motor ESP32 | QR forwarding checkbox is off or UART broken | Enable forwarding and check heartbeat |
 
 ## Final Checklist
 
-- [ ] Motor ESP32 joins `SumoVision`
-- [ ] Motor ESP32 IP is `192.168.4.2`
-- [ ] `GET /health` works
-- [ ] `GET /cmd?c=s&s=0` stops motors
-- [ ] `GET /cmd?c=f&s=80` moves forward
-- [ ] `GET /cmd?c=l&s=80` turns left
-- [ ] `GET /cmd?c=r&s=80` turns right
-- [ ] Watchdog stops motors after command timeout
-- [ ] Optional `GET /qr?id=A1` stores or handles QR ID
-- [ ] XIAO click sends commands to motor ESP32
-- [ ] XIAO QR forwarding shows HTTP `200`
+- [ ] XIAO UI loads over Wi-Fi
+- [ ] XIAO camera stream works
+- [ ] XIAO serial monitor shows UART pins
+- [ ] Motor ESP32 serial monitor starts correctly
+- [ ] XIAO D6/TX is wired to motor RX
+- [ ] XIAO D7/RX is wired to motor TX
+- [ ] GND is shared
+- [ ] Motor ESP32 receives heartbeat
+- [ ] XIAO receives ACK
+- [ ] Click sends `cmd` messages over UART
+- [ ] QR forwarding sends `qr` messages over UART
+- [ ] Motor watchdog stops motors when UART link is silent
+- [ ] Motor outputs are enabled only after direction testing

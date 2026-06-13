@@ -48,20 +48,27 @@ After camera calibration, set `enabled` to `true` and replace `H` with the measu
 ## Required Equipment
 
 - Assembled robot with fixed XIAO ESP32-S3 Sense camera position
-- Motor ESP32 reachable from XIAO over HTTP
+- Motor ESP32 wired to XIAO over UART
 - Laptop or phone connected to the XIAO Wi-Fi access point
 - Ruler or measuring tape
 - Printed checkerboard calibration sheet
 - Masking tape or marker for fixed start position
 - Flat test floor with enough space for 1 m forward driving
 
-## Network Setup Check
+## Link Setup Check
 
 Before measuring anything:
 
 1. Flash the XIAO click-and-go firmware.
-2. Flash or configure the motor ESP32 firmware.
-3. Connect the motor ESP32 to the XIAO Wi-Fi access point.
+2. Flash or configure the motor ESP32 UART firmware.
+3. Wire XIAO and motor ESP32:
+
+```text
+XIAO D6 / GPIO43 / TX -> Motor ESP32 RX
+XIAO D7 / GPIO44 / RX <- Motor ESP32 TX
+XIAO GND              -> Motor ESP32 GND
+```
+
 4. Open the XIAO UI:
 
 ```text
@@ -80,13 +87,13 @@ http://192.168.4.1:81/stream
 http://192.168.4.1/capture
 ```
 
-7. Press `STOP` in the UI and confirm the motor ESP32 receives:
+7. Press `STOP` in the UI and confirm the motor ESP32 serial monitor receives a UART message like:
 
-```text
-GET /cmd?c=s&s=0
+```json
+{"seq":1,"type":"cmd","cmd":"s","speed":0}
 ```
 
-Do not continue calibration until the XIAO can reliably send HTTP commands to the motor ESP32.
+Do not continue calibration until the XIAO can reliably send UART commands to the motor ESP32 and `/api/status` shows a recent `last_motor_ack`.
 
 ## Part 1: Motion Calibration
 
@@ -393,7 +400,7 @@ Always verify:
 | Problem | Likely Cause | Fix |
 | --- | --- | --- |
 | Camera stream is blank | Camera init or power issue | Check serial monitor and camera ribbon cable |
-| Clicks do nothing | Motor ESP32 not reachable | Check motor ESP32 IP and `MOTOR_BASE_URL` |
+| Clicks do nothing | UART link is not working | Check TX/RX wiring, shared GND, and `last_motor_ack` in `/api/status` |
 | Robot turns the wrong way | Motor mapping inverted | Swap left/right command mapping or motor wiring |
 | Robot drives too far | `DRIVE_MS_PER_CM` too high | Re-measure forward distance |
 | Robot stops short | `DRIVE_MS_PER_CM` too low | Re-measure forward distance |
