@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <Wire.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include "jsqr_gz.h"
@@ -28,66 +29,48 @@
 #define HREF_GPIO_NUM 47
 #define PCLK_GPIO_NUM 13
 
-static constexpr bool USE_SOFT_AP = true;
 static const char *AP_SSID = "SumoVision";
 static const char *AP_PASSWORD = "sumo1234";
 static const IPAddress AP_IP(192, 168, 4, 1);
 static const IPAddress AP_GATEWAY(192, 168, 4, 1);
 static const IPAddress AP_SUBNET(255, 255, 255, 0);
 
-// Used only when USE_SOFT_AP is false.
-static const char *STA_SSID = "CHANGE_ME";
-static const char *STA_PASSWORD = "CHANGE_ME";
+static const char *QR_READER_BASE_URL = "http://192.168.4.2";
+static const char *QR_READER_STREAM_URL = "http://192.168.4.2:81/stream";
 
-// Wired UART link to the motor ESP32.
-static constexpr uint32_t MOTOR_UART_BAUD = 115200;
-static constexpr int MOTOR_UART_TX_PIN = D6; // XIAO D6 / GPIO43 / TX -> motor ESP32 RX
-static constexpr int MOTOR_UART_RX_PIN = D7; // XIAO D7 / GPIO44 / RX <- motor ESP32 TX
-static constexpr uint16_t HEARTBEAT_INTERVAL_MS = 500;
+// M5Stack Unit Color / TCS3472-style sensor on the FrontCam board.
+static constexpr uint8_t COLOR_SDA_PIN = D4;
+static constexpr uint8_t COLOR_SCL_PIN = D5;
+static constexpr uint8_t COLOR_I2C_ADDRESS = 0x29;
+static constexpr uint16_t COLOR_DARK_CLEAR_THRESHOLD = 600;
+static constexpr unsigned long COLOR_READ_INTERVAL_MS = 300;
+static constexpr unsigned long COLOR_RETRY_INTERVAL_MS = 5000;
+
 static constexpr uint16_t HTTP_PORT = 80;
 static constexpr uint16_t STREAM_PORT = 81;
-
-// Open-loop tuning constants. Replace with measured values.
-static constexpr float TURN_MS_PER_DEG = 8.0f;
-static constexpr float DRIVE_MS_PER_CM = 35.0f;
-static constexpr uint16_t DEFAULT_SPEED = 150;
-static constexpr uint16_t TURN_SETTLE_MS = 150;
-static constexpr uint16_t MAX_TURN_MS = 1600;
-static constexpr uint16_t MAX_DRIVE_MS = 3000;
 
 static WebServer web(HTTP_PORT);
 static httpd_handle_t streamHttpd = nullptr;
 
-enum class MotionPhase {
-  IDLE,
-  TURNING,
-  TURN_SETTLE,
-  DRIVING,
-  DONE
+struct ColorReading {
+  bool online = false;
+  uint16_t clear = 0;
+  uint16_t red = 0;
+  uint16_t green = 0;
+  uint16_t blue = 0;
+  uint8_t redNorm = 0;
+  uint8_t greenNorm = 0;
+  uint8_t blueNorm = 0;
+  bool dark = false;
+  String dominant = "unknown";
+  String error;
+  unsigned long readCount = 0;
+  unsigned long lastReadMs = 0;
 };
 
-struct MotionPlan {
-  MotionPhase phase = MotionPhase::IDLE;
-  int turnDir = 0; // -1 left, +1 right, 0 no turn
-  uint16_t turnMs = 0;
-  uint16_t driveMs = 0;
-  uint16_t speed = DEFAULT_SPEED;
-  unsigned long deadlineMs = 0;
-  String lastError;
-};
-
-static MotionPlan plan;
-static String lastMotorCommand = "s";
-static uint32_t motorSequence = 0;
-static unsigned long uartTxCount = 0;
-static String lastMotorMessage = "";
-static String lastMotorAck = "";
-static String uartRxLine = "";
-static unsigned long lastHeartbeatMs = 0;
-static unsigned long clickCount = 0;
+static ColorReading colorReading;
 static String lastQrId = "";
 static unsigned long qrCount = 0;
-static bool lastQrForwarded = false;
 
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!doctype html>
@@ -151,7 +134,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       background: #050608;
       border: 1px solid var(--line);
     }
-    #stream {
+    .camera-stream {
       display: block;
       width: 100%;
       min-height: 240px;
@@ -267,7 +250,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <header>
     <div>
       <h1>SumoBot Click-And-Go</h1>
-      <p class="muted">Click on the camera image to send an open-loop turn + drive command.</p>
+      <p class="muted">Click the front camera image. Motor commands are sent to the QR reader board over HTTP.</p>
     </div>
     <button id="refresh" type="button">Refresh status</button>
   </header>
@@ -276,7 +259,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <section>
       <h2>Front camera</h2>
       <div class="video-shell" id="video-shell">
-        <img id="stream" alt="Camera stream">
+        <img id="stream" class="camera-stream" alt="Front camera stream">
         <div class="crosshair" id="crosshair"></div>
       </div>
     </section>
@@ -297,18 +280,36 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     </section>
   </div>
 
+  <div class="layout">
+    <section>
+      <h2>QR reader camera</h2>
+      <div class="video-shell">
+        <img id="qr-stream" class="camera-stream" alt="QR reader camera stream">
+      </div>
+      <p class="muted">Expected stream: http://192.168.4.2:81/stream</p>
+    </section>
+
+    <section>
+      <h2>QR scanner</h2>
+      <div class="grid">
+        <div class="metric"><span>Decoder</span><strong id="qr-decoder">starting</strong></div>
+        <div class="metric"><span>Last QR</span><strong id="qr-result">-</strong></div>
+        <div class="metric"><span>Sent</span><strong id="qr-sent">-</strong></div>
+        <div class="metric"><span>Status</span><strong id="qr-status">idle</strong></div>
+      </div>
+      <label>
+        <input id="qr-forward" type="checkbox">
+        Send QR ID to QR reader board
+      </label>
+    </section>
+  </div>
+
   <section>
-    <h2>QR scanner</h2>
+    <h2>Sensors</h2>
     <div class="grid">
-      <div class="metric"><span>Decoder</span><strong id="qr-decoder">starting</strong></div>
-      <div class="metric"><span>Last QR</span><strong id="qr-result">-</strong></div>
-      <div class="metric"><span>Sent</span><strong id="qr-sent">-</strong></div>
-      <div class="metric"><span>Status</span><strong id="qr-status">idle</strong></div>
+      <div class="metric"><span>Color</span><strong id="color-status">-</strong></div>
+      <div class="metric"><span>Obstacle distance</span><strong id="distance-status">-</strong></div>
     </div>
-    <label>
-      <input id="qr-forward" type="checkbox">
-      Forward QR ID to motor ESP32
-    </label>
   </section>
 
   <section>
@@ -319,7 +320,11 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
 <script src="/jsQR.js"></script>
 <script>
+const ROBOT_BASE_URL = "http://192.168.4.2";
+const ROBOT_STREAM_URL = "http://192.168.4.2:81/stream";
+
 const stream = document.getElementById("stream");
+const qrStream = document.getElementById("qr-stream");
 const shell = document.getElementById("video-shell");
 const crosshair = document.getElementById("crosshair");
 const speedInput = document.getElementById("speed");
@@ -328,6 +333,8 @@ const ground = document.getElementById("ground");
 const angle = document.getElementById("angle");
 const distance = document.getElementById("distance");
 const statusBox = document.getElementById("status");
+const colorStatus = document.getElementById("color-status");
+const distanceStatus = document.getElementById("distance-status");
 const qrDecoder = document.getElementById("qr-decoder");
 const qrResult = document.getElementById("qr-result");
 const qrSent = document.getElementById("qr-sent");
@@ -354,6 +361,8 @@ const CALIBRATION = {
 
 stream.crossOrigin = "anonymous";
 stream.src = `http://${location.hostname}:81/stream`;
+qrStream.crossOrigin = "anonymous";
+qrStream.src = ROBOT_STREAM_URL;
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -375,14 +384,39 @@ function fallbackPlan(px, py, width, height) {
   return { turnDir, turnMs, driveMs };
 }
 
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+  if (!response.ok) {
+    throw new Error(`${url} returned ${response.status}`);
+  }
+  return response.json();
+}
+
 async function refreshStatus() {
-  const response = await fetch("/api/status");
-  const data = await response.json();
-  statusBox.textContent = JSON.stringify(data, null, 2);
+  const front = await fetchJson("/api/status");
+  let robot = null;
+  try {
+    robot = await fetchJson(`${ROBOT_BASE_URL}/api/status`);
+  } catch (error) {
+    robot = { status: "offline", error: error.message };
+  }
+
+  const color = front.color || {};
+  colorStatus.textContent = color.online
+    ? `${color.dominant} c=${color.clear}`
+    : `offline ${color.error || ""}`;
+
+  const distanceReading = robot && robot.distance ? robot.distance : {};
+  distanceStatus.textContent = distanceReading.online
+    ? `${distanceReading.mm.toFixed(0)} mm`
+    : `offline ${distanceReading.error || ""}`;
+
+  statusBox.textContent = JSON.stringify({ front, robot }, null, 2);
 }
 
 async function sendStop() {
-  await fetch("/api/stop", { method: "POST" });
+  const data = await fetchJson(`${ROBOT_BASE_URL}/api/stop`, { method: "POST" });
+  statusBox.textContent = JSON.stringify(data, null, 2);
   await refreshStatus();
 }
 
@@ -441,30 +475,31 @@ async function postQrId(value) {
   lastPostedQr = value;
   lastPostedQrMs = now;
 
-  const params = new URLSearchParams({
-    id: value,
-    forward: qrForward.checked ? "1" : "0",
-  });
+  const params = new URLSearchParams({ id: value });
+  const front = await fetchJson(`/api/qr?${params.toString()}`, { method: "POST" });
+  let robot = null;
 
-  const response = await fetch(`/api/qr?${params.toString()}`, { method: "POST" });
-  const data = await response.json();
-  qrSent.textContent = data.forwarded ? `uart seq ${data.seq}` : "local";
-  statusBox.textContent = JSON.stringify(data, null, 2);
+  if (qrForward.checked) {
+    robot = await fetchJson(`${ROBOT_BASE_URL}/api/qr?${params.toString()}`, { method: "POST" });
+  }
+
+  qrSent.textContent = qrForward.checked ? "robot" : "local";
+  statusBox.textContent = JSON.stringify({ front, robot }, null, 2);
 }
 
 async function scanQrFrame() {
   if (qrMode === "none") {
     return;
   }
-  if (!stream.naturalWidth || !stream.naturalHeight) {
-    qrStatus.textContent = "waiting for video";
+  if (!qrStream.naturalWidth || !qrStream.naturalHeight) {
+    qrStatus.textContent = "waiting for QR camera";
     return;
   }
 
   try {
-    qrCanvas.width = stream.naturalWidth;
-    qrCanvas.height = stream.naturalHeight;
-    qrContext.drawImage(stream, 0, 0, qrCanvas.width, qrCanvas.height);
+    qrCanvas.width = qrStream.naturalWidth;
+    qrCanvas.height = qrStream.naturalHeight;
+    qrContext.drawImage(qrStream, 0, 0, qrCanvas.width, qrCanvas.height);
 
     const value = await decodeQrFromCanvas();
     if (!value) {
@@ -520,9 +555,12 @@ stream.addEventListener("click", async (event) => {
     params.set("drive_ms", String(plan.driveMs));
   }
 
-  const response = await fetch(`/api/click?${params.toString()}`);
-  const data = await response.json();
-  statusBox.textContent = JSON.stringify(data, null, 2);
+  try {
+    const data = await fetchJson(`${ROBOT_BASE_URL}/api/click?${params.toString()}`, { method: "POST" });
+    statusBox.textContent = JSON.stringify(data, null, 2);
+  } catch (error) {
+    statusBox.textContent = JSON.stringify({ status: "error", error: error.message }, null, 2);
+  }
 });
 
 document.getElementById("stop").addEventListener("click", () => void sendStop());
@@ -537,22 +575,6 @@ window.setInterval(() => void refreshStatus(), 5000);
 </html>
 )rawliteral";
 
-const char *phaseName(MotionPhase phase) {
-  switch (phase) {
-    case MotionPhase::IDLE:
-      return "idle";
-    case MotionPhase::TURNING:
-      return "turning";
-    case MotionPhase::TURN_SETTLE:
-      return "turn_settle";
-    case MotionPhase::DRIVING:
-      return "driving";
-    case MotionPhase::DONE:
-      return "done";
-  }
-  return "unknown";
-}
-
 String jsonEscape(const String &value) {
   String escaped;
   escaped.reserve(value.length() + 8);
@@ -560,179 +582,148 @@ String jsonEscape(const String &value) {
     const char c = value[i];
     if (c == '"' || c == '\\') {
       escaped += '\\';
+    } else if (c == '\n') {
+      escaped += "\\n";
+      continue;
+    } else if (c == '\r') {
+      continue;
     }
     escaped += c;
   }
   return escaped;
 }
 
-uint16_t boundedDuration(long value, uint16_t maxValue) {
-  if (value < 0) {
-    return 0;
-  }
-  if (value > maxValue) {
-    return maxValue;
-  }
-  return static_cast<uint16_t>(value);
+void addCorsHeaders() {
+  web.sendHeader("Access-Control-Allow-Origin", "*");
+  web.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  web.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  web.sendHeader("Cache-Control", "no-store");
 }
 
-uint16_t boundedSpeed(long value) {
-  if (value < 0) {
-    return 0;
-  }
-  if (value > 255) {
-    return 255;
-  }
-  return static_cast<uint16_t>(value);
+bool colorWrite8(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(COLOR_I2C_ADDRESS);
+  Wire.write(0x80 | reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
 }
 
-bool sendMotorJson(const String &json) {
-  Serial1.println(json);
-  lastMotorMessage = json;
-  uartTxCount++;
-  Serial.printf("Motor UART TX: %s\n", json.c_str());
-  plan.lastError = "";
+bool colorSensorPresent() {
+  Wire.beginTransmission(COLOR_I2C_ADDRESS);
+  return Wire.endTransmission() == 0;
+}
+
+bool colorRead8(uint8_t reg, uint8_t &value) {
+  Wire.beginTransmission(COLOR_I2C_ADDRESS);
+  Wire.write(0x80 | reg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+  if (Wire.requestFrom(COLOR_I2C_ADDRESS, static_cast<uint8_t>(1)) != 1) {
+    return false;
+  }
+  value = Wire.read();
   return true;
 }
 
-uint32_t nextMotorSequence() {
-  motorSequence++;
-  if (motorSequence == 0) {
-    motorSequence = 1;
+bool colorRead16(uint8_t reg, uint16_t &value) {
+  Wire.beginTransmission(COLOR_I2C_ADDRESS);
+  Wire.write(0x80 | reg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
   }
-  return motorSequence;
+  if (Wire.requestFrom(COLOR_I2C_ADDRESS, static_cast<uint8_t>(2)) != 2) {
+    return false;
+  }
+  const uint8_t low = Wire.read();
+  const uint8_t high = Wire.read();
+  value = static_cast<uint16_t>(low | (high << 8));
+  return true;
 }
 
-bool sendMotorCommand(const String &code, uint16_t speed) {
-  const uint32_t seq = nextMotorSequence();
-  lastMotorCommand = code;
+bool initColorSensor() {
+  Wire.begin(COLOR_SDA_PIN, COLOR_SCL_PIN, 100000U);
+  delay(20);
 
-  String json = "{";
-  json += "\"seq\":" + String(seq) + ",";
-  json += "\"type\":\"cmd\",";
-  json += "\"cmd\":\"" + jsonEscape(code) + "\",";
-  json += "\"speed\":" + String(speed);
-  json += "}";
+  if (!colorSensorPresent()) {
+    colorReading.online = false;
+    colorReading.error = "TCS3472 not found";
+    return false;
+  }
 
-  return sendMotorJson(json);
+  uint8_t id = 0;
+  if (!colorRead8(0x12, id)) {
+    colorReading.online = false;
+    colorReading.error = "TCS3472 not found";
+    return false;
+  }
+
+  // 50 ms integration time, 4x gain, power on + RGBC ADC enabled.
+  colorWrite8(0x01, 0xEB);
+  colorWrite8(0x0F, 0x01);
+  colorWrite8(0x00, 0x01);
+  delay(3);
+  colorWrite8(0x00, 0x03);
+
+  colorReading.online = true;
+  colorReading.error = "";
+  Serial.printf("Color sensor ready on I2C 0x%02X, ID=0x%02X\n", COLOR_I2C_ADDRESS, id);
+  return true;
 }
 
-bool forwardQrToMotor(const String &qrId) {
-  const uint32_t seq = nextMotorSequence();
-
-  String json = "{";
-  json += "\"seq\":" + String(seq) + ",";
-  json += "\"type\":\"qr\",";
-  json += "\"id\":\"" + jsonEscape(qrId) + "\"";
-  json += "}";
-
-  return sendMotorJson(json);
-}
-
-void sendHeartbeatIfDue() {
+void updateColorReading(bool force = false) {
   const unsigned long now = millis();
-  if (now - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) {
+  const unsigned long interval = colorReading.online ? COLOR_READ_INTERVAL_MS : COLOR_RETRY_INTERVAL_MS;
+  if (!force && now - colorReading.lastReadMs < interval) {
     return;
   }
 
-  lastHeartbeatMs = now;
-  const uint32_t seq = nextMotorSequence();
+  colorReading.lastReadMs = now;
 
-  String json = "{";
-  json += "\"seq\":" + String(seq) + ",";
-  json += "\"type\":\"heartbeat\",";
-  json += "\"ms\":" + String(now);
-  json += "}";
-
-  sendMotorJson(json);
-}
-
-void readMotorAck() {
-  while (Serial1.available() > 0) {
-    const char c = static_cast<char>(Serial1.read());
-    if (c == '\r') {
-      continue;
-    }
-    if (c == '\n') {
-      if (uartRxLine.length() > 0) {
-        lastMotorAck = uartRxLine;
-        Serial.printf("Motor UART RX: %s\n", lastMotorAck.c_str());
-        uartRxLine = "";
-      }
-      continue;
-    }
-
-    if (uartRxLine.length() < 240) {
-      uartRxLine += c;
-    } else {
-      uartRxLine = "";
-      plan.lastError = "Motor UART RX line too long";
-    }
-  }
-}
-
-void cancelMotion() {
-  plan.phase = MotionPhase::IDLE;
-  plan.deadlineMs = 0;
-  sendMotorCommand("s", 0);
-}
-
-void scheduleMotion(int turnDir, uint16_t turnMs, uint16_t driveMs, uint16_t speed) {
-  cancelMotion();
-
-  plan.turnDir = turnDir < 0 ? -1 : (turnDir > 0 ? 1 : 0);
-  plan.turnMs = turnMs;
-  plan.driveMs = driveMs;
-  plan.speed = speed;
-
-  if (plan.turnDir != 0 && plan.turnMs > 0) {
-    sendMotorCommand(plan.turnDir > 0 ? "r" : "l", plan.speed);
-    plan.phase = MotionPhase::TURNING;
-    plan.deadlineMs = millis() + plan.turnMs;
+  if (!colorSensorPresent()) {
+    colorReading.online = false;
+    colorReading.error = "TCS3472 not found";
     return;
   }
 
-  if (plan.driveMs > 0) {
-    sendMotorCommand("f", plan.speed);
-    plan.phase = MotionPhase::DRIVING;
-    plan.deadlineMs = millis() + plan.driveMs;
+  uint16_t clear = 0;
+  uint16_t red = 0;
+  uint16_t green = 0;
+  uint16_t blue = 0;
+
+  if (!colorRead16(0x14, clear) || !colorRead16(0x16, red) || !colorRead16(0x18, green) ||
+      !colorRead16(0x1A, blue)) {
+    colorReading.online = false;
+    colorReading.error = "read failed";
     return;
   }
 
-  plan.phase = MotionPhase::DONE;
-}
+  colorReading.online = true;
+  colorReading.error = "";
+  colorReading.clear = clear;
+  colorReading.red = red;
+  colorReading.green = green;
+  colorReading.blue = blue;
+  colorReading.dark = clear < COLOR_DARK_CLEAR_THRESHOLD;
+  colorReading.readCount++;
 
-void updateMotionPlan() {
-  if (plan.phase == MotionPhase::IDLE || plan.phase == MotionPhase::DONE) {
-    return;
+  if (clear > 0) {
+    colorReading.redNorm = static_cast<uint8_t>(min(255UL, (static_cast<unsigned long>(red) * 255UL) / clear));
+    colorReading.greenNorm = static_cast<uint8_t>(min(255UL, (static_cast<unsigned long>(green) * 255UL) / clear));
+    colorReading.blueNorm = static_cast<uint8_t>(min(255UL, (static_cast<unsigned long>(blue) * 255UL) / clear));
+  } else {
+    colorReading.redNorm = 0;
+    colorReading.greenNorm = 0;
+    colorReading.blueNorm = 0;
   }
 
-  const long remaining = static_cast<long>(plan.deadlineMs - millis());
-  if (remaining > 0) {
-    return;
-  }
-
-  if (plan.phase == MotionPhase::TURNING) {
-    sendMotorCommand("s", 0);
-    plan.phase = MotionPhase::TURN_SETTLE;
-    plan.deadlineMs = millis() + TURN_SETTLE_MS;
-    return;
-  }
-
-  if (plan.phase == MotionPhase::TURN_SETTLE) {
-    if (plan.driveMs > 0) {
-      sendMotorCommand("f", plan.speed);
-      plan.phase = MotionPhase::DRIVING;
-      plan.deadlineMs = millis() + plan.driveMs;
-    } else {
-      plan.phase = MotionPhase::DONE;
-    }
-    return;
-  }
-
-  if (plan.phase == MotionPhase::DRIVING) {
-    sendMotorCommand("s", 0);
-    plan.phase = MotionPhase::DONE;
+  if (colorReading.dark) {
+    colorReading.dominant = "dark";
+  } else if (red >= green && red >= blue) {
+    colorReading.dominant = "red";
+  } else if (green >= red && green >= blue) {
+    colorReading.dominant = "green";
+  } else {
+    colorReading.dominant = "blue";
   }
 }
 
@@ -789,26 +780,18 @@ bool initCamera() {
 }
 
 void startWiFi() {
+  WiFi.persistent(false);
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
-
-  if (USE_SOFT_AP) {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
-    Serial.printf("XIAO AP SSID: %s\n", AP_SSID);
-    Serial.printf("XIAO AP IP: %s\n", WiFi.softAPIP().toString().c_str());
-    return;
-  }
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(STA_SSID, STA_PASSWORD);
-  Serial.printf("Connecting to Wi-Fi SSID: %s", STA_SSID);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.printf("XIAO STA IP: %s\n", WiFi.localIP().toString().c_str());
+  WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
+  const bool apStarted = WiFi.softAP(AP_SSID, AP_PASSWORD, 1, 0, 4);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  Serial.printf("FrontCam AP started: %s\n", apStarted ? "true" : "false");
+  Serial.printf("FrontCam AP SSID: %s\n", AP_SSID);
+  Serial.printf("FrontCam AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+  Serial.printf("FrontCam AP MAC: %s\n", WiFi.softAPmacAddress().c_str());
 }
 
 static esp_err_t streamHandler(httpd_req_t *req) {
@@ -867,10 +850,29 @@ void startStreamServer() {
 
   if (httpd_start(&streamHttpd, &config) == ESP_OK) {
     httpd_register_uri_handler(streamHttpd, &streamUri);
-    Serial.printf("Stream ready on port %u\n", STREAM_PORT);
+    Serial.printf("Front camera stream ready on port %u\n", STREAM_PORT);
   } else {
     Serial.println("Failed to start stream server");
   }
+}
+
+String colorJson() {
+  updateColorReading(true);
+  String json = "{";
+  json += "\"online\":" + String(colorReading.online ? "true" : "false") + ",";
+  json += "\"clear\":" + String(colorReading.clear) + ",";
+  json += "\"red\":" + String(colorReading.red) + ",";
+  json += "\"green\":" + String(colorReading.green) + ",";
+  json += "\"blue\":" + String(colorReading.blue) + ",";
+  json += "\"red_norm\":" + String(colorReading.redNorm) + ",";
+  json += "\"green_norm\":" + String(colorReading.greenNorm) + ",";
+  json += "\"blue_norm\":" + String(colorReading.blueNorm) + ",";
+  json += "\"dominant\":\"" + jsonEscape(colorReading.dominant) + "\",";
+  json += "\"dark\":" + String(colorReading.dark ? "true" : "false") + ",";
+  json += "\"read_count\":" + String(colorReading.readCount) + ",";
+  json += "\"error\":\"" + jsonEscape(colorReading.error) + "\"";
+  json += "}";
+  return json;
 }
 
 void handleRoot() {
@@ -888,39 +890,37 @@ void handleJsQr() {
 }
 
 void handleStatus() {
-  const IPAddress ip = USE_SOFT_AP ? WiFi.softAPIP() : WiFi.localIP();
+  addCorsHeaders();
+  const IPAddress ip = WiFi.softAPIP();
   String json = "{";
   json += "\"status\":\"ok\",";
+  json += "\"role\":\"front_cam\",";
   json += "\"ip\":\"" + ip.toString() + "\",";
   json += "\"stream_url\":\"http://" + ip.toString() + ":" + String(STREAM_PORT) + "/stream\",";
-  json += "\"motor_uart_baud\":" + String(MOTOR_UART_BAUD) + ",";
-  json += "\"motor_uart_tx_pin\":" + String(MOTOR_UART_TX_PIN) + ",";
-  json += "\"motor_uart_rx_pin\":" + String(MOTOR_UART_RX_PIN) + ",";
-  json += "\"motion_phase\":\"" + String(phaseName(plan.phase)) + "\",";
-  json += "\"last_motor_command\":\"" + lastMotorCommand + "\",";
-  json += "\"motor_sequence\":" + String(motorSequence) + ",";
-  json += "\"uart_tx_count\":" + String(uartTxCount) + ",";
-  json += "\"last_motor_message\":\"" + jsonEscape(lastMotorMessage) + "\",";
-  json += "\"last_motor_ack\":\"" + jsonEscape(lastMotorAck) + "\",";
+  json += "\"qr_reader_base_url\":\"" + String(QR_READER_BASE_URL) + "\",";
+  json += "\"qr_reader_stream_url\":\"" + String(QR_READER_STREAM_URL) + "\",";
+  json += "\"color\":" + colorJson() + ",";
   json += "\"last_qr_id\":\"" + jsonEscape(lastQrId) + "\",";
-  json += "\"qr_count\":" + String(qrCount) + ",";
-  json += "\"last_qr_forwarded\":" + String(lastQrForwarded ? "true" : "false") + ",";
-  json += "\"click_count\":" + String(clickCount) + ",";
-  json += "\"turn_ms\":" + String(plan.turnMs) + ",";
-  json += "\"drive_ms\":" + String(plan.driveMs) + ",";
-  json += "\"speed\":" + String(plan.speed) + ",";
-  json += "\"last_error\":\"" + jsonEscape(plan.lastError) + "\"";
+  json += "\"qr_count\":" + String(qrCount);
   json += "}";
   web.send(200, "application/json", json);
+}
+
+void handleColor() {
+  addCorsHeaders();
+  web.send(200, "application/json", colorJson());
 }
 
 void handleCapture() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (fb == nullptr) {
+    addCorsHeaders();
     web.send(503, "application/json", "{\"status\":\"error\",\"error\":\"Camera capture failed\"}");
     return;
   }
 
+  web.sendHeader("Access-Control-Allow-Origin", "*");
+  web.sendHeader("Cache-Control", "no-store");
   web.setContentLength(fb->len);
   web.send(200, "image/jpeg", "");
   WiFiClient client = web.client();
@@ -928,42 +928,8 @@ void handleCapture() {
   esp_camera_fb_return(fb);
 }
 
-void handleClick() {
-  clickCount++;
-
-  const uint16_t speed = boundedSpeed(web.arg("speed").toInt());
-  int turnDir = 0;
-  uint16_t turnMs = 0;
-  uint16_t driveMs = 0;
-
-  if (web.hasArg("angle") && web.hasArg("distance")) {
-    const float angleDeg = web.arg("angle").toFloat();
-    const float distanceCm = web.arg("distance").toFloat();
-    turnDir = fabs(angleDeg) < 5.0f ? 0 : (angleDeg > 0 ? 1 : -1);
-    turnMs = boundedDuration(lroundf(fabs(angleDeg) * TURN_MS_PER_DEG), MAX_TURN_MS);
-    driveMs = boundedDuration(lroundf(distanceCm * DRIVE_MS_PER_CM), MAX_DRIVE_MS);
-  } else {
-    turnDir = web.arg("turn_dir").toInt();
-    turnMs = boundedDuration(web.arg("turn_ms").toInt(), MAX_TURN_MS);
-    driveMs = boundedDuration(web.arg("drive_ms").toInt(), MAX_DRIVE_MS);
-  }
-
-  scheduleMotion(turnDir, turnMs, driveMs, speed);
-
-  String json = "{";
-  json += "\"status\":\"accepted\",";
-  json += "\"click_count\":" + String(clickCount) + ",";
-  json += "\"turn_dir\":" + String(plan.turnDir) + ",";
-  json += "\"turn_ms\":" + String(plan.turnMs) + ",";
-  json += "\"drive_ms\":" + String(plan.driveMs) + ",";
-  json += "\"speed\":" + String(plan.speed) + ",";
-  json += "\"motion_phase\":\"" + String(phaseName(plan.phase)) + "\",";
-  json += "\"last_error\":\"" + jsonEscape(plan.lastError) + "\"";
-  json += "}";
-  web.send(200, "application/json", json);
-}
-
 void handleQr() {
+  addCorsHeaders();
   if (!web.hasArg("id")) {
     web.send(400, "application/json", "{\"status\":\"error\",\"error\":\"Missing QR id\"}");
     return;
@@ -972,31 +938,27 @@ void handleQr() {
   lastQrId = web.arg("id");
   qrCount++;
 
-  const bool shouldForward = web.arg("forward") == "1";
-  bool forwarded = false;
-  if (shouldForward) {
-    forwarded = forwardQrToMotor(lastQrId);
-  }
-  lastQrForwarded = forwarded;
-
   String json = "{";
   json += "\"status\":\"ok\",";
+  json += "\"role\":\"front_cam\",";
   json += "\"id\":\"" + jsonEscape(lastQrId) + "\",";
-  json += "\"qr_count\":" + String(qrCount) + ",";
-  json += "\"forward_requested\":" + String(shouldForward ? "true" : "false") + ",";
-  json += "\"forwarded\":" + String(forwarded ? "true" : "false") + ",";
-  json += "\"seq\":" + String(motorSequence) + ",";
-  json += "\"last_error\":\"" + jsonEscape(plan.lastError) + "\"";
+  json += "\"qr_count\":" + String(qrCount);
   json += "}";
   web.send(200, "application/json", json);
 }
 
-void handleStop() {
-  cancelMotion();
-  web.send(200, "application/json", "{\"status\":\"stopped\"}");
+void handleOptions() {
+  addCorsHeaders();
+  web.send(204);
 }
 
 void handleNotFound() {
+  if (web.method() == HTTP_OPTIONS) {
+    handleOptions();
+    return;
+  }
+
+  addCorsHeaders();
   web.send(404, "application/json", "{\"status\":\"error\",\"error\":\"not found\"}");
 }
 
@@ -1004,43 +966,38 @@ void startWebRoutes() {
   web.on("/", HTTP_GET, handleRoot);
   web.on("/jsQR.js", HTTP_GET, handleJsQr);
   web.on("/api/status", HTTP_GET, handleStatus);
-  web.on("/api/click", HTTP_GET, handleClick);
+  web.on("/api/status", HTTP_OPTIONS, handleOptions);
+  web.on("/api/color", HTTP_GET, handleColor);
+  web.on("/api/color", HTTP_OPTIONS, handleOptions);
   web.on("/api/qr", HTTP_POST, handleQr);
   web.on("/api/qr", HTTP_GET, handleQr);
-  web.on("/api/stop", HTTP_POST, handleStop);
+  web.on("/api/qr", HTTP_OPTIONS, handleOptions);
   web.on("/capture", HTTP_GET, handleCapture);
   web.onNotFound(handleNotFound);
   web.begin();
-  Serial.printf("Control UI ready on port %u\n", HTTP_PORT);
+  Serial.printf("FrontCam UI ready on port %u\n", HTTP_PORT);
 }
 
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
-  Serial1.begin(MOTOR_UART_BAUD, SERIAL_8N1, MOTOR_UART_RX_PIN, MOTOR_UART_TX_PIN);
   delay(800);
 
   Serial.println();
-  Serial.println("Starting XIAO Click-And-Go");
-  Serial.printf(
-      "Motor UART: baud=%lu TX=D6/GPIO%d RX=D7/GPIO%d\n",
-      static_cast<unsigned long>(MOTOR_UART_BAUD),
-      MOTOR_UART_TX_PIN,
-      MOTOR_UART_RX_PIN);
+  Serial.println("Starting FrontCam XIAO");
 
   if (!initCamera()) {
     Serial.println("Camera failed; UI will not be useful until this is fixed.");
   }
 
+  initColorSensor();
   startWiFi();
   startWebRoutes();
   startStreamServer();
 }
 
 void loop() {
-  readMotorAck();
-  sendHeartbeatIfDue();
   web.handleClient();
-  updateMotionPlan();
+  updateColorReading();
   delay(2);
 }

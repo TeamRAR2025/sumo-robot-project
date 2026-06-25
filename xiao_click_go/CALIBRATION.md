@@ -5,7 +5,7 @@ This guide explains how to calibrate the XIAO click-and-go system once the robot
 The goal is to make this chain work:
 
 ```text
-camera click in browser -> pixel coordinates -> ground coordinates -> turn + drive command -> motor ESP32
+camera click in browser -> pixel coordinates -> ground coordinates -> HTTP command -> QR Reader XIAO -> motor driver
 ```
 
 There are two separate calibrations:
@@ -20,7 +20,7 @@ You can prepare the printed calibration pattern and data tables before the robot
 Motion constants live in:
 
 ```text
-xiao_click_go/src/main.cpp
+qr_reader_xiao/src/main.cpp
 ```
 
 Update:
@@ -48,8 +48,9 @@ After camera calibration, set `enabled` to `true` and replace `H` with the measu
 ## Required Equipment
 
 - Assembled robot with fixed XIAO ESP32-S3 Sense camera position
-- Motor ESP32 wired to XIAO over UART
-- Laptop or phone connected to the XIAO Wi-Fi access point
+- FrontCam XIAO with color sensor
+- QR Reader XIAO with motor driver and distance sensor
+- Laptop or phone connected to the FrontCam `SumoVision` Wi-Fi access point
 - Ruler or measuring tape
 - Printed checkerboard calibration sheet
 - Masking tape or marker for fixed start position
@@ -60,14 +61,8 @@ After camera calibration, set `enabled` to `true` and replace `H` with the measu
 Before measuring anything:
 
 1. Flash the XIAO click-and-go firmware.
-2. Flash or configure the motor ESP32 UART firmware.
-3. Wire XIAO and motor ESP32:
-
-```text
-XIAO D6 / GPIO43 / TX -> Motor ESP32 RX
-XIAO D7 / GPIO44 / RX <- Motor ESP32 TX
-XIAO GND              -> Motor ESP32 GND
-```
+2. Flash the QR Reader XIAO firmware.
+3. Start FrontCam first, then reset QR Reader so it joins `SumoVision` as `192.168.4.2`.
 
 4. Open the XIAO UI:
 
@@ -87,17 +82,23 @@ http://192.168.4.1:81/stream
 http://192.168.4.1/capture
 ```
 
-7. Press `STOP` in the UI and confirm the motor ESP32 serial monitor receives a UART message like:
+7. Check QR Reader status:
 
-```json
-{"seq":1,"type":"cmd","cmd":"s","speed":0}
+```text
+http://192.168.4.2/api/status
 ```
 
-Do not continue calibration until the XIAO can reliably send UART commands to the motor ESP32 and `/api/status` shows a recent `last_motor_ack`.
+8. Press `STOP` in the UI and confirm the QR Reader responds:
+
+```json
+{"status":"stopped","motor":{"last_command":"s","left_speed":0,"right_speed":0}}
+```
+
+Do not continue calibration until the browser can reliably call `http://192.168.4.2/api/status` and `POST http://192.168.4.2/api/stop`.
 
 ## Part 1: Motion Calibration
 
-The first version of click-and-go uses open-loop motion. The XIAO sends timed commands to the motor ESP32:
+The first version of click-and-go uses open-loop motion. The QR Reader XIAO applies timed motor states:
 
 ```text
 turn left/right for N milliseconds
@@ -180,7 +181,7 @@ Use the median `ms/cm` value.
 Open:
 
 ```text
-xiao_click_go/src/main.cpp
+qr_reader_xiao/src/main.cpp
 ```
 
 Update:
@@ -393,14 +394,14 @@ Always verify:
 - STOP button stops the robot immediately.
 - Clicks do not create excessive movement duration.
 - Robot does not drive outside the test area.
-- Motor ESP32 ignores invalid or malformed commands.
+- QR Reader XIAO rejects invalid commands and stops on `cmd=s`.
 
 ## Troubleshooting
 
 | Problem | Likely Cause | Fix |
 | --- | --- | --- |
 | Camera stream is blank | Camera init or power issue | Check serial monitor and camera ribbon cable |
-| Clicks do nothing | UART link is not working | Check TX/RX wiring, shared GND, and `last_motor_ack` in `/api/status` |
+| Clicks do nothing | QR Reader HTTP API is offline or blocked | Check `http://192.168.4.2/api/status` from the same browser |
 | Robot turns the wrong way | Motor mapping inverted | Swap left/right command mapping or motor wiring |
 | Robot drives too far | `DRIVE_MS_PER_CM` too high | Re-measure forward distance |
 | Robot stops short | `DRIVE_MS_PER_CM` too low | Re-measure forward distance |
@@ -417,7 +418,7 @@ Fill this section after testing:
 Robot:
 Camera mount:
 Motor driver:
-Motor ESP32 IP:
+QR Reader IP:
 Speed used:
 
 TURN_MS_PER_DEG:
